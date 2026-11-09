@@ -186,35 +186,48 @@ function render(ta::TextArea, rect::Rect, buf::Buffer)
         y = y_start + vi - 1
         line = ta.lines[li]
 
-        # Horizontal scroll per line (keep cursor visible)
-        h_offset = 0
-        if li == ta.cursor_row && ta.cursor_col >= vis_width
-            h_offset = ta.cursor_col - vis_width + 1
-        end
+        _render_textarea_line!(buf, ta, line, li == ta.cursor_row && ta.focused,
+                               x_start, y, vis_width, cur_style)
+    end
+end
 
-        for ci in 1:vis_width
-            char_idx = h_offset + ci
-            x = x_start + ci - 1
-            x > right(rect) && break
+# Display-column aware line drawing: wide glyphs occupy two cells and the
+# horizontal scroll keeps the cursor cell visible, matching TextInput.
+_ta_cw(ch::Char) = max(1, textwidth(ch))
 
-            is_cursor = ta.focused && li == ta.cursor_row &&
-                        char_idx == ta.cursor_col + 1
-
-            if char_idx >= 1 && char_idx <= length(line)
-                ch = line[char_idx]
-                set_char!(buf, x, y, ch, is_cursor ? cur_style : ta.style)
-            elseif is_cursor
-                set_char!(buf, x, y, ' ', cur_style)
-            end
-        end
-
-        # Cursor at position 0 (before all text on this line)
-        if ta.focused && li == ta.cursor_row && ta.cursor_col == 0 && h_offset == 0
-            if !isempty(line)
-                set_char!(buf, x_start, y, line[1], cur_style)
-            else
-                set_char!(buf, x_start, y, ' ', cur_style)
-            end
+function _render_textarea_line!(buf::Buffer, ta::TextArea, line::Vector{Char},
+                                has_cursor::Bool, x0::Int, y::Int, width::Int,
+                                cur_style::Style)
+    n = length(line)
+    cursor_col = 0
+    if has_cursor
+        for i in 1:ta.cursor_col
+            cursor_col += _ta_cw(line[i])
         end
     end
+    cursor_w = has_cursor && ta.cursor_col < n ? _ta_cw(line[ta.cursor_col + 1]) : 1
+    scroll = has_cursor && cursor_col + cursor_w > width ? cursor_col + cursor_w - width : 0
+    last_x = x0 + width - 1
+    col = 0
+    for idx in 1:n
+        ch = line[idx]
+        w = _ta_cw(ch)
+        scol = col - scroll
+        col += w
+        (scol + w <= 0 || scol >= width) && continue
+        x = x0 + scol
+        style = has_cursor && idx == ta.cursor_col + 1 ? cur_style : ta.style
+        if w == 2 && scol >= 0 && x + 1 <= last_x
+            set_char!(buf, x, y, ch, style)
+            set_char!(buf, x + 1, y, WIDE_CHAR_PAD, style)
+        else
+            draw_x = max(x, x0)
+            draw_x <= last_x && set_char!(buf, draw_x, y, w == 2 ? ' ' : ch, style)
+        end
+    end
+    if has_cursor && ta.cursor_col == n
+        scol = col - scroll
+        0 <= scol < width && set_char!(buf, x0 + scol, y, ' ', cur_style)
+    end
+    nothing
 end

@@ -88,6 +88,35 @@
         @test occursin('─', out) || occursin('│', out)  # a box was drawn
     end
 
+    @testset "should_draw skips identical frames; events still draw" begin
+        @kwdef mutable struct _Skip <: T.Model
+            iterations::Int = 0
+            views::Int = 0
+            every::Int = 0
+            keys::Int = 0
+            key_iteration::Int = 0
+            drawn::Vector{Int} = Int[]
+        end
+        T.pre_render!(m::_Skip) = (m.iterations += 1)
+        T.should_quit(m::_Skip) = m.iterations >= 30
+        T.should_draw(m::_Skip) = m.every > 0 && m.iterations % m.every == 0
+        # Events are dispatched before pre_render!, so they belong to the next iteration.
+        T.update!(m::_Skip, ::T.KeyEvent) = (m.keys += 1; m.key_iteration = m.iterations + 1)
+        T.view(m::_Skip, f::T.Frame) = (m.views += 1; push!(m.drawn, m.iterations); render(Block(title = "s"), f.area, f.buffer))
+        # The first frame is always drawn; afterwards only on request.
+        for (every, expected) in ((0, 1), (5, 1 + 6))
+            m = _Skip(every = every)
+            app(m; io = IOBuffer(), tty_size = (rows = 8, cols = 40), fps = 240, input = IOBuffer())
+            @test m.views == expected
+        end
+        # A dispatched key forces a frame although the model reports no change.
+        m = _Skip()
+        app(m; io = IOBuffer(), tty_size = (rows = 8, cols = 40), fps = 240, input = IOBuffer("x"))
+        @test m.keys == 1 && m.key_iteration in m.drawn && m.views <= 2
+        # Models that do not opt in keep drawing every frame.
+        @test T.should_draw(_DummyModel())
+    end
+
     @testset "app(io=...) does not dup fd 0 (no INPUT_IO, no EINVAL)" begin
         # The wart the maintainer flagged: app() dup'd fd 0 unconditionally,
         # and Base.TTY(RawFD(dup(0))) throws EINVAL when fd 0 is not a tty --

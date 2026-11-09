@@ -7,6 +7,19 @@
         @test esc.key == :escape
     end
 
+    @testset "Legacy CSI Home/End variants" begin
+        for (number, key) in ((1, :home), (7, :home), (4, :end_key), (8, :end_key))
+            for (suffix, action) in (("", T.key_press), (";5:2", T.key_repeat), (";1:3", T.key_release))
+                params = Vector{UInt8}(codeunits(string(number, suffix)))
+                before = copy(params)
+                event = T.csi_to_key(params, '~')
+                @test event.key == key
+                @test event.action == action
+                @test params == before
+            end
+        end
+    end
+
     @testset "Event hierarchy" begin
         @test T.KeyEvent <: T.Event
         @test T.MouseEvent <: T.Event

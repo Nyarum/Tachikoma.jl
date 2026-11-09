@@ -293,6 +293,8 @@ function read_escape()
     # Another \e immediately following: the first was a stray byte (e.g. a probe
     # response whose lead byte arrived alone).  Recursively parse from the second.
     b == 0x1b && return read_escape()
+    # Legacy Alt/Meta+Enter: ESC followed by carriage return.
+    b == 0x0d && return KeyEvent(:alt_enter)
     # Any other unrecognised byte after \e is not a standard Escape key sequence.
     # Return :unknown rather than :escape to avoid false quit triggers from
     # stray bytes in terminal responses.
@@ -311,16 +313,25 @@ function _consume_until_st()
     end
 end
 
+# Alternate key codes, modifiers/event type and associated Unicode text can
+# exceed 16 bytes. Bound storage, but consume an oversized CSI through its
+# final byte so its numeric tail cannot become ordinary keyboard input.
+const _MAX_CSI_PARAMS = 256
+
 function read_csi()
     params = UInt8[]
+    overflow = false
     while true
         b = read_byte(0.05)
         b === nothing && return KeyEvent(:unknown)
         if b >= 0x40 && b <= 0x7e
-            return csi_to_key(params, Char(b))
+            return overflow ? KeyEvent(:unknown) : csi_to_key(params, Char(b))
         end
-        push!(params, b)
-        length(params) > 16 && return KeyEvent(:unknown)
+        if length(params) < _MAX_CSI_PARAMS
+            push!(params, b)
+        else
+            overflow = true
+        end
     end
 end
 
@@ -361,7 +372,11 @@ function csi_to_key(params::Vector{UInt8}, final::Char)
     final == 'R' && return KeyEvent(:f3, action)
     final == 'S' && return KeyEvent(:f4, action)
     if final == '~' && !isempty(params)
+        modified = _modify_other_keys_enter(params)
+        modified === nothing || return KeyEvent(modified, action)
         n = parse_csi_num(params)
+        n in (1, 7) && return KeyEvent(:home, action)
+        n in (4, 8) && return KeyEvent(:end_key, action)
         n == 2  && return KeyEvent(:insert, action)
         n == 3  && return KeyEvent(:delete, action)
         n == 5  && return KeyEvent(:pageup, action)
@@ -382,6 +397,17 @@ function csi_to_key(params::Vector{UInt8}, final::Char)
     # Log unknown CSI sequences for debugging
     _log_unknown_csi(params, final)
     return KeyEvent(:unknown)
+end
+
+# xterm modifyOtherKeys reports modified Enter as CSI 27 ; modifiers ; 13 ~.
+function _modify_other_keys_enter(params::Vector{UInt8})
+    parts = Base.split(String(copy(params)), ';')
+    (length(parts) == 3 && parts[1] == "27" && parts[3] == "13") || return nothing
+    bits = something(tryparse(Int, parts[2]), 1) - 1
+    (bits & 4) != 0 && return nothing
+    (bits & 2) != 0 && return :alt_enter
+    (bits & 1) != 0 && return :shift_enter
+    nothing
 end
 
 # Debug log for unrecognized CSI sequences (ring buffer, last 20)
@@ -614,6 +640,11 @@ function _kitty_keycode_to_event(keycode::Int, shifted::Union{Int,Nothing},
     sym = get(KITTY_FUNCTIONAL_KEYS, keycode, nothing)
     sym !== nothing && return KeyEvent(sym, action)
     keycode == 27  && return KeyEvent(:escape, action)
+    # Enter with Shift/Alt is distinct so chat composers can insert newlines.
+    if keycode == 13 && !ctrl
+        alt && return KeyEvent(:alt_enter, action)
+        shift && return KeyEvent(:shift_enter, action)
+    end
     keycode == 13  && return KeyEvent(:enter, action)
     keycode == 9   && return KeyEvent(:tab, action)
     keycode == 127 && return KeyEvent(:backspace, action)

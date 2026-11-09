@@ -1196,7 +1196,7 @@ function flush!(t::Terminal, io::IO)
             else
                 glyph = cell_glyph(cc)
                 write(io, glyph)
-                w = textwidth(glyph)
+                w = grapheme_width(glyph)
             end
             # Wide chars advance the terminal cursor by 2 columns.
             last_col = col + max(w, 1) - 1
@@ -1328,6 +1328,27 @@ function set_size!(t::Terminal, sz)
     return true
 end
 
+# Use t.io directly when it's a TTY — after stdout/stderr capture redirect, the
+# global stdout is a pipe and terminal_size() can't reach the real terminal on Windows.
+function _local_size(t::Terminal)
+    t.io isa Base.TTY || return terminal_size()
+    s = displaysize(t.io)
+    (rows=s[1], cols=s[2])
+end
+
+"""
+    size_changed(t::Terminal) → Bool
+
+Whether the next `draw!` will resize, probed without resizing. A remote TTY is
+polled by `check_resize!` on drawn frames only (its probe spawns a process).
+"""
+function size_changed(t::Terminal)
+    t.external_size && return t.pending_clear
+    t.remote_tty_path === nothing || return false
+    sz = _local_size(t)
+    Rect(1, 1, sz.cols, sz.rows) != t.size
+end
+
 function check_resize!(t::Terminal)
     # An injected sink cannot be probed: it is not a tty and has no size of
     # its own. Probing anyway reaches for stdout, which under the app's own
@@ -1346,15 +1367,7 @@ function check_resize!(t::Terminal)
         t.frame_count % 60 == 0 || return false
         sz = _tty_size(t.remote_tty_path)
     else
-        # Use t.io directly when it's a TTY — after stdout/stderr capture
-        # redirect, the global stdout is a pipe and terminal_size() can't
-        # reach the real terminal on Windows.
-        sz = if t.io isa Base.TTY
-            s = displaysize(t.io)
-            (rows=s[1], cols=s[2])
-        else
-            terminal_size()
-        end
+        sz = _local_size(t)
     end
     new_rect = Rect(1, 1, sz.cols, sz.rows)
     new_rect == t.size && return false

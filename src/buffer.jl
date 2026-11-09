@@ -43,8 +43,57 @@ Base.:(==)(a::Cell, b::Cell) = (
     return isempty(c.suffix) ? string(c.char) : string(c.char, c.suffix)
 end
 
+# Terminal columns are grapheme widths, not the sum of codepoint widths.
+# PCRE's Unicode properties distinguish emoji sequences from ordinary combining
+# text (including non-emoji ZWJ). Ambiguous-width text keeps Julia's narrow policy.
+const _EMOJI = r"\p{Emoji}"
+const _PICTOGRAPH = r"\p{Extended_Pictographic}"
+const _MODIFIER_BASE = r"\p{Emoji_Modifier_Base}"
+
+function grapheme_width(g::AbstractString)
+    # One codepoint: every emoji-sequence rule below needs two, so the width is
+    # the character's own (checked for all of Unicode in test_buffer_width.jl).
+    i = firstindex(g)
+    i <= ncodeunits(g) && nextind(g, i) > ncodeunits(g) && return textwidth(g[i])
+    if occursin('\ufe0f', g) && occursin(_EMOJI, g) ||
+       occursin('\u200d', g) && occursin(_PICTOGRAPH, g) ||
+       any(c -> '\U0001f3fb' <= c <= '\U0001f3ff', g) && occursin(_MODIFIER_BASE, g) ||
+       occursin('\u20e3', g) && first(g) in "#*0123456789"
+        return 2
+    end
+    textwidth(g)
+end
+
+# Base.Unicode.graphemes without its per-grapheme allocations: the grapheme
+# starting at `i` ends at `j` and the next one starts at `k`. `state` carries
+# the segmentation state across graphemes exactly as GraphemeIterator does.
+@inline function _grapheme_span(s::AbstractString, i::Int, state::Ref{Int32})
+    c0, k = iterate(s, i)::Tuple{Char,Int}
+    j = i
+    n = ncodeunits(s)
+    while k <= n
+        c, l = iterate(s, k)::Tuple{Char,Int}
+        Base.Unicode.isgraphemebreak!(state, c0, c) && break
+        j, k, c0 = k, l, c
+    end
+    j, k
+end
+
+"""Display columns under the narrow ambiguous-width, emoji-cluster terminal policy."""
+function display_width(s::AbstractString)
+    _is_simple_latin(s) && return textwidth(s)
+    state = Ref{Int32}(0)
+    i, n, width = firstindex(s), ncodeunits(s), 0
+    while i <= n
+        j, k = _grapheme_span(s, i, state)
+        width += j == i ? textwidth(s[i]) : grapheme_width(SubString(s, i, j))
+        i = k
+    end
+    width
+end
+
 @inline function cell_width(c::Cell)
-    return textwidth(cell_glyph(c))
+    return isempty(c.suffix) ? textwidth(c.char) : grapheme_width(cell_glyph(c))
 end
 
 # Truncate `s` to fit at most `w` DISPLAY columns (wide/CJK chars count as 2),
@@ -55,12 +104,12 @@ end
 # so table/header/label truncation must go through this.
 function truncate_to_width(s::AbstractString, w::Integer; ellipsis::AbstractString = "…")
     w <= 0 && return ""
-    textwidth(s) <= w && return String(s)
-    budget = max(0, w - textwidth(ellipsis))
+    display_width(s) <= w && return String(s)
+    budget = max(0, w - display_width(ellipsis))
     io = IOBuffer()
     acc = 0
     for g in Base.Unicode.graphemes(s)
-        gw = textwidth(g)
+        gw = grapheme_width(g)
         acc + gw > budget && break
         print(io, g)
         acc += gw
@@ -126,6 +175,7 @@ function set_char!(buf::Buffer, x::Int, y::Int, ch::Char,
         end
         buf.content[i] = Cell(ch, style)
     end
+    nothing # not the stored Cell: returning it would box one per write
 end
 
 # Split a rendered glyph into its base character and any remaining suffix bytes.
@@ -179,6 +229,7 @@ function _set_glyph!(buf::Buffer, x::Int, y::Int, glyph::AbstractString,
         end
         buf.content[i] = Cell(ch, style, suffix)
     end
+    nothing # not the stored Cell: returning it would box one per write
 end
 
 # Append `glyph` to the suffix of the cell at `(x, y)`.
@@ -229,14 +280,22 @@ function set_string!(buf::Buffer, x::Int, y::Int,
         return col
     end
 
-    # Slow path: grapheme-aware for combining marks and wide chars
+    # Slow path: grapheme-aware for combining marks and wide chars. A grapheme of
+    # one codepoint (most non-ASCII text) is written as a Char without allocating;
+    # only real clusters become a String glyph.
     last_drawn_col = x - 1
-    for grapheme in Base.Unicode.graphemes(clean)
-        glyph = String(grapheme)
+    state = Ref{Int32}(0)
+    i, n = firstindex(clean), ncodeunits(clean)
+    while i <= n
+        j, k = _grapheme_span(clean, i, state)
+        start, i = i, k
         col > clip && break
-        w = textwidth(glyph)
+        single = j == start
+        ch = clean[start]
+        glyph = single ? "" : String(SubString(clean, start, j))
+        w = single ? textwidth(ch) : grapheme_width(glyph)
         if w == 0
-            last_drawn_col >= x && _append_glyph!(buf, last_drawn_col, y, glyph)
+            last_drawn_col >= x && _append_glyph!(buf, last_drawn_col, y, single ? string(ch) : glyph)
             continue
         end
         if w == 2
@@ -246,10 +305,10 @@ function set_string!(buf::Buffer, x::Int, y::Int,
                 col += 1
                 continue
             end
-            in_bounds(buf, col, y) && _set_glyph!(buf, col, y, glyph, style)
+            in_bounds(buf, col, y) && (single ? set_char!(buf, col, y, ch, style) : _set_glyph!(buf, col, y, glyph, style))
             in_bounds(buf, col + 1, y) && set_char!(buf, col + 1, y, WIDE_CHAR_PAD, style)
         else
-            in_bounds(buf, col, y) && _set_glyph!(buf, col, y, glyph, style)
+            in_bounds(buf, col, y) && (single ? set_char!(buf, col, y, ch, style) : _set_glyph!(buf, col, y, glyph, style))
         end
         last_drawn_col = col
         col += max(w, 1)

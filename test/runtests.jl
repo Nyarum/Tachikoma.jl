@@ -19,6 +19,7 @@ struct _DummyModel <: T.Model end
     include("test_kitty_graphics.jl")
     include("test_layout.jl")
     include("test_pbt.jl")
+    include("test_buffer_width.jl")
     include("test_widgets_extended.jl")
     include("test_codeeditor.jl")
     include("test_backgrounds.jl")

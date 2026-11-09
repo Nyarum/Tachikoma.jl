@@ -30,7 +30,8 @@ macro tachikoma_app()
     esc(quote
         import Tachikoma: view, update!, should_quit, init!, cleanup!,
                           handle_all_key_actions, copy_rect, task_queue,
-                          recording_enabled, has_pending_output, set_wake!
+                          recording_enabled, has_pending_output, set_wake!,
+                          should_draw
     end)
 end
 
@@ -52,6 +53,16 @@ cleanup!(::Model) = nothing
 should_quit(::Model) = false
 pre_render!(::Model) = nothing
 post_render!(::Model) = nothing
+
+"""
+    should_draw(model::Model) → Bool
+
+Called once per frame after `pre_render!`. Return `false` when the screen would
+be identical to the last frame, to skip `view`/`draw!` entirely. The frame is
+drawn anyway when an event was dispatched, an overlay or recording is active,
+or the terminal was resized. Default: `true` (draw every frame).
+"""
+should_draw(::Model) = true
 
 
 """
@@ -270,6 +281,9 @@ end
 function overlay_active(overlay::AppOverlay)
     overlay.show_theme || overlay.show_help || overlay.show_settings || overlay.show_export
 end
+# Overlay state that changes per frame (fading notification, recording capture).
+_overlay_animating(overlay::AppOverlay, t) = overlay_active(overlay) || overlay.notify_ttl > 0 ||
+    t.recorder.active || overlay.pending_stop || overlay.pending_export
 
 function render_overlay!(overlay::AppOverlay, f::Frame)
     overlay.show_theme && return render_theme_overlay!(overlay, f)
@@ -1114,9 +1128,11 @@ function app(model::Model; fps=60, default_bindings=true, on_stdout=nothing, on_
 
                 # Process all buffered input (stdin bytes, or console records on
                 # the Windows backend — see _input_available/_read_next_event).
+                dispatched = false  # any event this iteration forces a frame
                 while INPUT_ACTIVE[] && _input_available()
                     evt = _read_next_event()
                     evt === nothing && continue   # record consumed but not an event (key-up, resize, no-op)
+                    dispatched = true
                     Base.invokelatest(dispatch_event!, t, overlay, model, evt, default_bindings)
                 end
                 # Drain wake channel (non-blocking) to clear async signals
@@ -1125,6 +1141,7 @@ function app(model::Model; fps=60, default_bindings=true, on_stdout=nothing, on_
                 end
                 # Drain async task queues
                 drain_tasks!(_framework_tasks) do tevt
+                    dispatched = true
                     if tevt isa TaskEvent && tevt.id == :_export_done
                         msg = tevt.value
                         overlay.notify_text = msg isa String ? msg : "Export failed"
@@ -1138,6 +1155,7 @@ function app(model::Model; fps=60, default_bindings=true, on_stdout=nothing, on_
                 _user_tq = task_queue(model)
                 if _user_tq !== nothing
                     drain_tasks!(_user_tq) do tevt
+                        dispatched = true
                         Base.invokelatest(dispatch_event!, t, overlay, model, tevt, default_bindings)
                     end
                 end
@@ -1161,17 +1179,22 @@ function app(model::Model; fps=60, default_bindings=true, on_stdout=nothing, on_
                     end
                 end
                 Base.invokelatest(pre_render!, model)
-                draw!(t) do f
-                    Base.invokelatest() do
-                        if default_bindings && overlay_active(overlay)
-                            render_overlay!(overlay, f)
-                        else
-                            view(model, f)
-                            default_bindings && render_overlay!(overlay, f)
+                # Always ask the model, so it can record what this frame shows.
+                wanted = Base.invokelatest(should_draw, model)
+                if wanted || dispatched || t.frame_count == 0 || size_changed(t) ||
+                   (default_bindings && _overlay_animating(overlay, t))
+                    draw!(t) do f
+                        Base.invokelatest() do
+                            if default_bindings && overlay_active(overlay)
+                                render_overlay!(overlay, f)
+                            else
+                                view(model, f)
+                                default_bindings && render_overlay!(overlay, f)
+                            end
                         end
                     end
+                    Base.invokelatest(post_render!, model)
                 end
-                Base.invokelatest(post_render!, model)
                 # Process deferred operations AFTER draw so status is visible
                 if default_bindings && overlay.pending_stop
                     overlay.pending_stop = false

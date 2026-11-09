@@ -16,7 +16,20 @@ function Tachikoma.markdown_to_spans(md::AbstractString, width::Int;
                                       link_style::Tachikoma.Style = Tachikoma.Style(fg=Tachikoma.BLUE.c400),
                                       quote_style::Tachikoma.Style = Tachikoma.Style(fg=Tachikoma.SLATE.c400),
                                       text_style::Tachikoma.Style = Tachikoma.Style(fg=Tachikoma.SLATE.c200),
-                                      hr_style::Tachikoma.Style = Tachikoma.Style(fg=Tachikoma.SLATE.c600))
+                                      hr_style::Tachikoma.Style = Tachikoma.Style(fg=Tachikoma.SLATE.c600),
+                                      # Finer-grained roles; defaults keep the shared styles above.
+                                      code_block_style::Tachikoma.Style = code_style,
+                                      quote_border_style::Tachikoma.Style = quote_style,
+                                      # Text inside quotes; `nothing` keeps text_style (quote_style is the bar).
+                                      quote_text_style::Union{Nothing,Tachikoma.Style} = nothing,
+                                      list_marker_style::Tachikoma.Style = text_style,
+                                      table_head_style::Tachikoma.Style = Tachikoma.Style(fg=text_style.fg, bold=true),
+                                      table_border_style::Tachikoma.Style = hr_style,
+                                      # TokenKind -> Style for highlighted code; NoColor fg keeps the code color.
+                                      token_style::Function = Tachikoma.token_style,
+                                      table_overflow::Symbol = :truncate,
+                                      show_link_urls::Bool = false)
+    table_overflow in (:truncate, :wrap) || throw(ArgumentError("invalid table_overflow"))
     width < 1 && return [Tachikoma.Span[]]
     parser = CommonMark.Parser()
     CommonMark.enable!(parser, CommonMark.TableRule())
@@ -26,10 +39,12 @@ function Tachikoma.markdown_to_spans(md::AbstractString, width::Int;
     ast = parser(md)
     ctx = WalkContext(width, h1_style, h2_style, h3_style,
                       bold_style, emph_style, code_style, link_style,
-                      quote_style, text_style, hr_style)
+                      quote_style, text_style, hr_style, table_overflow, show_link_urls,
+                      code_block_style, quote_border_style, list_marker_style,
+                      table_head_style, table_border_style, token_style, quote_text_style)
     _walk_blocks!(ctx, ast)
     # Remove trailing blank line if present
-    while !isempty(ctx.lines) && _is_blank_line(ctx.lines[end])
+    if !isempty(ctx.lines) && _is_blank_line(ctx.lines[end])
         pop!(ctx.lines)
     end
     isempty(ctx.lines) ? [Tachikoma.Span[]] : ctx.lines
@@ -49,26 +64,48 @@ struct WalkContext
     quote_s::Tachikoma.Style
     text::Tachikoma.Style
     hr::Tachikoma.Style
+    table_overflow::Symbol
+    show_link_urls::Bool
+    code_block::Tachikoma.Style
+    quote_border::Tachikoma.Style
+    list_marker::Tachikoma.Style
+    table_head::Tachikoma.Style
+    table_border::Tachikoma.Style
+    token_style::Function
+    quote_text::Union{Nothing,Tachikoma.Style}
     lines::Vector{Vector{Tachikoma.Span}}
     prefix::Vector{String}         # stack of line prefixes (blockquote nesting)
     prefix_style::Vector{Tachikoma.Style}
 end
 
-function WalkContext(width, h1, h2, h3, bold, emph, code, link, quote_s, text, hr)
-    WalkContext(width, h1, h2, h3, bold, emph, code, link, quote_s, text, hr,
+function WalkContext(width, h1, h2, h3, bold, emph, code, link, quote_s, text, hr, table_overflow, show_link_urls,
+                     code_block=code, quote_border=quote_s, list_marker=text,
+                     table_head=Tachikoma.Style(fg=text.fg, bold=true), table_border=hr,
+                     token_style=Tachikoma.token_style, quote_text=nothing)
+    WalkContext(width, h1, h2, h3, bold, emph, code, link, quote_s, text, hr, table_overflow, show_link_urls,
+                code_block, quote_border, list_marker, table_head, table_border, token_style, quote_text,
                 Vector{Tachikoma.Span}[], String[], Tachikoma.Style[])
 end
 
-_current_prefix(ctx::WalkContext) = join(ctx.prefix)
-_current_prefix_len(ctx::WalkContext) = sum(length, ctx.prefix; init=0)
+# Same output buffers and prefixes, different body text style.
+_with_text(ctx::WalkContext, text::Tachikoma.Style) =
+    WalkContext((f === :text ? text : getfield(ctx, f) for f in fieldnames(WalkContext))...)
+
+_current_prefix(ctx::WalkContext) = Tachikoma.truncate_to_width(join(ctx.prefix), max(0, ctx.width - 2); ellipsis="")
+_current_prefix_len(ctx::WalkContext) = Tachikoma.display_width(_current_prefix(ctx))
 
 function _push_line!(ctx::WalkContext, spans::Vector{Tachikoma.Span})
     pfx = _current_prefix(ctx)
     if !isempty(pfx)
         pstyle = isempty(ctx.prefix_style) ? ctx.text : ctx.prefix_style[end]
-        pushfirst!(spans, Tachikoma.Span(pfx, pstyle))
+        spans = [Tachikoma.Span(pfx, pstyle); spans]
     end
-    push!(ctx.lines, spans)
+    # Safety net for tiny widths and deeply nested decorative prefixes.
+    if sum(s -> Tachikoma.display_width(s.content), spans; init=0) > ctx.width
+        append!(ctx.lines, _wrap_spans(spans, ctx.width, ctx.text; word_wrap=false))
+    else
+        push!(ctx.lines, spans)
+    end
 end
 
 function _push_blank!(ctx::WalkContext)
@@ -107,8 +144,13 @@ function _handle_block!(ctx::WalkContext, node)
     elseif t isa CommonMark.Document
         _walk_blocks!(ctx, node)
     else
-        # Unknown block — try recursing into children
-        _walk_blocks!(ctx, node)
+        # Unknown literal blocks (including HTML) remain visible, never executed.
+        if !isempty(node.literal)
+            _emit_wrapped!(ctx, [Tachikoma.Span(node.literal, ctx.text)])
+            _push_blank!(ctx)
+        else
+            _walk_blocks!(ctx, node)
+        end
     end
 end
 
@@ -118,7 +160,7 @@ function _handle_heading!(ctx::WalkContext, node)
     level = node.t.level
     style = level == 1 ? ctx.h1 : level == 2 ? ctx.h2 : ctx.h3
     spans = _collect_inlines(ctx, node, style)
-    _push_line!(ctx, spans)
+    _emit_wrapped!(ctx, spans)
     _push_blank!(ctx)
 end
 
@@ -142,17 +184,18 @@ end
 # Other languages fall back to uniform code_style.
 
 function _tokens_to_spans(chars::Vector{Char}, tokens::Vector{Tachikoma.Token},
-                           code_bg::Tachikoma.AbstractColor)
-    isempty(tokens) && return [Tachikoma.Span(String(chars), Tachikoma.Style(bg=code_bg))]
+                           code_style::Tachikoma.Style, token_style::Function=Tachikoma.token_style)
+    code_bg = code_style.bg
+    isempty(tokens) && return [Tachikoma.Span(String(chars), code_style)]
     spans = Tachikoma.Span[]
     pos = 1
     for tok in tokens
         if tok.start > pos
             push!(spans, Tachikoma.Span(String(chars[pos:tok.start-1]),
-                                        Tachikoma.Style(bg=code_bg)))
+                                        code_style))
         end
-        ts = Tachikoma.token_style(tok.kind)
-        merged = Tachikoma.Style(fg=ts.fg, bg=code_bg,
+        ts = token_style(tok.kind)
+        merged = Tachikoma.Style(fg=ts.fg isa Tachikoma.NoColor ? code_style.fg : ts.fg, bg=code_bg,
                                   bold=ts.bold, dim=ts.dim,
                                   italic=ts.italic, underline=ts.underline)
         push!(spans, Tachikoma.Span(String(chars[tok.start:tok.stop]), merged))
@@ -160,33 +203,34 @@ function _tokens_to_spans(chars::Vector{Char}, tokens::Vector{Tachikoma.Token},
     end
     if pos <= length(chars)
         push!(spans, Tachikoma.Span(String(chars[pos:end]),
-                                    Tachikoma.Style(bg=code_bg)))
+                                    code_style))
     end
     spans
 end
 
-function _highlight_code_line(line::AbstractString, code_bg::Tachikoma.AbstractColor,
-                               lang::AbstractString)
+function _highlight_code_line(line::AbstractString, code_style::Tachikoma.Style,
+                               lang::AbstractString, token_style::Function=Tachikoma.token_style)
     chars = collect(Char, line)
     tokens = Tachikoma.tokenize_code(lang, chars)
     tokens === nothing && return nothing
-    _tokens_to_spans(chars, tokens, code_bg)
+    _tokens_to_spans(chars, tokens, code_style, token_style)
 end
 
 function _handle_codeblock!(ctx::WalkContext, node)
     info = node.t.info
-    lang = lowercase(strip(string(info)))
+    lang = isempty(strip(string(info))) ? "" : lowercase(first(split(string(info))))
 
     code_text = node.literal
     code_text === nothing && (code_text = "")
-    code_bg = ctx.code.bg
-    for line in split(rstrip(code_text), '\n')
-        spans = _highlight_code_line(line, code_bg, lang)
-        if spans !== nothing
-            _push_line!(ctx, spans)
-        else
-            _push_line!(ctx, [Tachikoma.Span(string(line), ctx.code)])
-        end
+    # CommonMark supplies one structural final newline; preserve all other
+    # whitespace, including trailing spaces and blank lines in the code.
+    code_lines = split(code_text, '\n'; keepempty=true)
+    endswith(code_text, "\n") && pop!(code_lines)
+    isempty(code_lines) && push!(code_lines, "")
+    for line in code_lines
+        spans = _highlight_code_line(line, ctx.code_block, lang, ctx.token_style)
+        spans === nothing && (spans = [Tachikoma.Span(string(line), ctx.code_block)])
+        _emit_wrapped!(ctx, spans; word_wrap=false)
     end
     _push_blank!(ctx)
 end
@@ -194,11 +238,24 @@ end
 # ── BlockQuote ───────────────────────────────────────────────────────
 
 function _handle_blockquote!(ctx::WalkContext, node)
+    start = length(ctx.lines)
     push!(ctx.prefix, "│ ")
-    push!(ctx.prefix_style, ctx.quote_s)
-    _walk_blocks!(ctx, node)
+    push!(ctx.prefix_style, ctx.quote_border)
+    _walk_blocks!(ctx.quote_text === nothing ? ctx : _with_text(ctx, ctx.quote_text), node)
+    _drop_trailing_blank!(ctx, start)
     pop!(ctx.prefix)
     pop!(ctx.prefix_style)
+    _push_blank!(ctx)
+end
+
+# Inner blocks end with a blank carrying the container prefix ("│ ", list
+# indent). Call while that prefix is active; the caller then pushes one blank
+# at the container's own level.
+function _drop_trailing_blank!(ctx::WalkContext, start::Int)
+    length(ctx.lines) > start || return
+    text = rstrip(join(s.content for s in ctx.lines[end]))
+    (isempty(text) || text == rstrip(_current_prefix(ctx))) && pop!(ctx.lines)
+    nothing
 end
 
 # ── List ─────────────────────────────────────────────────────────────
@@ -207,6 +264,7 @@ function _handle_list!(ctx::WalkContext, node)
     is_ordered = node.t.list_data.type === :ordered
     start_num = node.t.list_data.start
     idx = start_num
+    start = length(ctx.lines)
     child = node.first_child
     while !CommonMark.isnull(child)
         if child.t isa CommonMark.Item || _is_task_item(child.t)
@@ -214,6 +272,13 @@ function _handle_list!(ctx::WalkContext, node)
             idx += 1
         end
         child = child.nxt
+    end
+    # A sublist that closes its parent item stays tight with the next item.
+    parent = node.parent
+    nested = !CommonMark.isnull(parent) && (parent.t isa CommonMark.Item || _is_task_item(parent.t))
+    if !nested || !CommonMark.isnull(node.nxt)
+        _drop_trailing_blank!(ctx, start)
+        _push_blank!(ctx)
     end
 end
 
@@ -233,16 +298,19 @@ function _handle_list_item!(ctx::WalkContext, node, is_ordered::Bool, idx::Int)
     while !CommonMark.isnull(child)
         if first_block && child.t isa CommonMark.Paragraph
             spans = _collect_inlines(ctx, child, ctx.text)
-            pushfirst!(spans, Tachikoma.Span(bullet, ctx.text))
-            avail = ctx.width - _current_prefix_len(ctx)
+            indent_width = min(Tachikoma.display_width(bullet), max(0, ctx.width - _current_prefix_len(ctx) - 2))
+            marker = Tachikoma.truncate_to_width(bullet, indent_width; ellipsis="")
+            avail = ctx.width - _current_prefix_len(ctx) - Tachikoma.display_width(marker)
             wrapped = _wrap_spans(spans, avail, ctx.text)
-            for line in wrapped
-                _push_line!(ctx, line)
+            for (i, line) in enumerate(wrapped)
+                prefix = i == 1 ? Tachikoma.Span(marker, ctx.list_marker) :
+                    Tachikoma.Span(" "^Tachikoma.display_width(marker), ctx.text)
+                _push_line!(ctx, [prefix; line])
             end
             first_block = false
         else
             if first_block
-                _push_line!(ctx, [Tachikoma.Span(bullet, ctx.text)])
+                _push_line!(ctx, [Tachikoma.Span(bullet, ctx.list_marker)])
                 first_block = false
             end
             # Indent continuation
@@ -255,6 +323,7 @@ function _handle_list_item!(ctx::WalkContext, node, is_ordered::Bool, idx::Int)
         end
         child = child.nxt
     end
+    first_block && _emit_wrapped!(ctx, [Tachikoma.Span(bullet, ctx.list_marker)])
 end
 
 # ── Thematic break ───────────────────────────────────────────────────
@@ -267,10 +336,10 @@ end
 
 # ── Table ────────────────────────────────────────────────────────────
 
-# Columns are sized to their widest cell and shrunk, widest first, until the row fits; a cell wider
-# than its column is cut with "…". Header rows are bold and ruled off from the body.
+# Columns shrink widest-first. Legacy :truncate preserves the original API;
+# :wrap keeps values complete, stacking labelled cells on very narrow screens.
 function _handle_table!(ctx::WalkContext, node)
-    header_style = Tachikoma.Style(fg = ctx.text.fg, bold = true)
+    header_style = ctx.table_head
     rows = Tuple{Bool,Vector{Tuple{Vector{Tachikoma.Span},Symbol}}}[]
     for (n, entering) in node
         (entering && n.t isa CommonMark.TableRow) || continue
@@ -294,28 +363,58 @@ function _handle_table!(ctx::WalkContext, node)
     for (_, cells) in rows, (j, (spans, _)) in enumerate(cells)
         widths[j] = max(widths[j], _spans_width(spans))
     end
+    widths .= max.(widths, 1)
     sep = " │ "
     avail = ctx.width - _current_prefix_len(ctx)
-    while sum(widths) + textwidth(sep) * (ncols - 1) > avail && maximum(widths) > 1
+    if ctx.table_overflow == :wrap && avail < sum(min.(widths, 8)) + Tachikoma.display_width(sep) * (ncols - 1)
+        # Too narrow even for useful columns: stack labelled cells per row.
+        headers = rows[1][1] ? rows[1][2] : nothing
+        for (header, cells) in rows
+            header && continue
+            for (j, (cell, _)) in enumerate(cells)
+                label = headers === nothing ? [Tachikoma.Span("$j: ", header_style)] :
+                    [headers[j][1]; Tachikoma.Span(": ", ctx.text)]
+                _emit_wrapped!(ctx, [label; cell])
+            end
+            _push_blank!(ctx)
+        end
+        # A table consisting only of headers must remain visible as well.
+        if all(first, rows)
+            for (cell, _) in rows[1][2]
+                _emit_wrapped!(ctx, cell)
+            end
+            _push_blank!(ctx)
+        end
+        return
+    end
+    while sum(widths) + Tachikoma.display_width(sep) * (ncols - 1) > avail && maximum(widths) > 1
         widths[argmax(widths)] -= 1
     end
 
     for (i, (header, cells)) in enumerate(rows)
-        line = Tachikoma.Span[]
-        for j in 1:ncols
-            j > 1 && push!(line, Tachikoma.Span(sep, ctx.hr))
-            spans, align = j <= length(cells) ? cells[j] : (Tachikoma.Span[], :left)
-            append!(line, _fit_cell(spans, widths[j], align, ctx.text))
+        cell_lines = [j <= length(cells) ?
+            (ctx.table_overflow == :wrap ? _wrap_spans(cells[j][1], widths[j], ctx.text) : [cells[j][1]]) :
+            [Tachikoma.Span[]] for j in 1:ncols]
+        for k in 1:maximum(length, cell_lines)
+            line = Tachikoma.Span[]
+            for j in 1:ncols
+                j > 1 && push!(line, Tachikoma.Span(sep, ctx.table_border))
+                spans = k <= length(cell_lines[j]) ? cell_lines[j][k] : Tachikoma.Span[]
+                align = j <= length(cells) ? cells[j][2] : :left
+                append!(line, _fit_cell(spans, widths[j], align, ctx.text))
+            end
+            _push_line!(ctx, line)
         end
-        _push_line!(ctx, line)
-        if header && (i == length(rows) || !rows[i + 1][1])
-            _push_line!(ctx, [Tachikoma.Span(join(("─"^w for w in widths), "─┼─"), ctx.hr)])
+        # Wrapped logical rows need a visible boundary, not just the header.
+        if (header && (i == length(rows) || !rows[i + 1][1])) ||
+           (ctx.table_overflow == :wrap && !header && i < length(rows))
+            _push_line!(ctx, [Tachikoma.Span(join(("─"^w for w in widths), "─┼─"), ctx.table_border)])
         end
     end
     _push_blank!(ctx)
 end
 
-_spans_width(spans) = sum(s -> textwidth(s.content), spans; init = 0)
+_spans_width(spans) = Tachikoma.display_width(join(s.content for s in spans))
 
 # `spans` cut to `w` display columns (ending in "…" if cut) and padded to exactly `w` per `align`.
 function _fit_cell(spans::Vector{Tachikoma.Span}, w::Int, align::Symbol, pad_style::Tachikoma.Style)
@@ -325,7 +424,7 @@ function _fit_cell(spans::Vector{Tachikoma.Span}, w::Int, align::Symbol, pad_sty
         budget = w - 1   # room for the ellipsis
         for s in spans
             budget <= 0 && break
-            sw = textwidth(s.content)
+            sw = Tachikoma.display_width(s.content)
             if sw <= budget
                 push!(out, s)
                 budget -= sw
@@ -358,24 +457,28 @@ function _collect_inlines(ctx::WalkContext, node, base_style::Tachikoma.Style)
         if _t isa CommonMark.Text
             push!(spans, Tachikoma.Span(n.literal, style_stack[end]))
         elseif _t isa CommonMark.Code
-            push!(spans, Tachikoma.Span(n.literal, ctx.code))
+            push!(spans, Tachikoma.Span(n.literal, _merge_style(style_stack[end], ctx.code)))
         elseif _t isa CommonMark.Strong
             if entering
-                push!(style_stack, ctx.bold)
+                push!(style_stack, _merge_style(style_stack[end], ctx.bold))
             else
                 length(style_stack) > 1 && pop!(style_stack)
             end
         elseif _t isa CommonMark.Emph
             if entering
-                push!(style_stack, ctx.emph)
+                push!(style_stack, _merge_style(style_stack[end], ctx.emph))
             else
                 length(style_stack) > 1 && pop!(style_stack)
             end
         elseif _t isa CommonMark.Link
             if entering
-                push!(style_stack, ctx.link)
+                push!(style_stack, _merge_style(style_stack[end], ctx.link))
             else
                 length(style_stack) > 1 && pop!(style_stack)
+                if ctx.show_link_urls && !isempty(n.t.destination)
+                    label = join(child.literal for (child, enter) in n if enter && child.t isa CommonMark.Text)
+                    label == n.t.destination || push!(spans, Tachikoma.Span(" (" * n.t.destination * ")", _merge_style(style_stack[end], ctx.link)))
+                end
             end
         elseif _t isa CommonMark.Image
             if entering
@@ -386,8 +489,10 @@ function _collect_inlines(ctx::WalkContext, node, base_style::Tachikoma.Style)
         elseif _t isa CommonMark.SoftBreak
             push!(spans, Tachikoma.Span(" ", style_stack[end]))
         elseif _t isa CommonMark.LineBreak
-            # Hard break — handled by wrapping; insert a space
-            push!(spans, Tachikoma.Span(" ", style_stack[end]))
+            push!(spans, Tachikoma.Span("\n", style_stack[end]))
+        elseif entering && !isempty(n.literal)
+            # Preserve unknown literal inline nodes, including raw HTML.
+            push!(spans, Tachikoma.Span(n.literal, style_stack[end]))
         end
     end
     spans
@@ -395,62 +500,102 @@ end
 
 # ── Word wrapper ─────────────────────────────────────────────────────
 
+# Grapheme-aware wrapping across Span boundaries. A formatting boundary is not
+# a word boundary; styles follow the first codepoint of each display grapheme.
 function _wrap_spans(spans::Vector{Tachikoma.Span}, width::Int,
-                     space_style::Tachikoma.Style=Tachikoma.Style())
-    width < 1 && return [spans]
+                     space_style::Tachikoma.Style=Tachikoma.Style(); word_wrap::Bool=true)
+    width = max(1, width)
+    source = join(s.content for s in spans)
+    units = Tuple{String,Tachikoma.Style}[]
+    si, edge = 1, isempty(spans) ? 0 : ncodeunits(spans[1].content)
+    pos = 1
+    for graph in Base.Unicode.graphemes(source)
+        while si < length(spans) && pos > edge
+            si += 1
+            edge += ncodeunits(spans[si].content)
+        end
+        style = isempty(spans) ? space_style : spans[si].style
+        # A wide glyph cannot be represented in one terminal column. Make
+        # progress with a visible replacement rather than writing out of bounds.
+        g = Tachikoma.display_width(graph) > width ? "�" : String(graph)
+        push!(units, (g, style))
+        pos += ncodeunits(graph)
+    end
     lines = Vector{Tachikoma.Span}[]
     current = Tachikoma.Span[]
     col = 0
-
-    for span in spans
-        content = span.content
-        # Preserve leading/trailing spaces from the original span content.
-        # CommonMark places spaces as separate Text nodes or within the text,
-        # so we must not blindly insert spaces between every span.
-        has_leading_space = !isempty(content) && content[1] == ' '
-        has_trailing_space = !isempty(content) && length(content) > 1 && content[end] == ' '
-        words = split(content, ' '; keepempty=false)
-        if isempty(words)
-            # Span was whitespace-only — treat as a single space
-            if col > 0
-                push!(current, Tachikoma.Span(" ", space_style))
-                col += 1
-            end
-            continue
+    function emit(g, style)
+        if !isempty(current) && current[end].style == style
+            current[end] = Tachikoma.Span(current[end].content * g, style)
+        else
+            push!(current, Tachikoma.Span(g, style))
         end
-        for (i, word) in enumerate(words)
-            w = length(word)
-            # Only insert a space if the original content had a space before
-            # this word (inter-word space), or if this is not the first word.
-            # For the first word, only add space if the span had leading whitespace.
-            need_space = if i == 1
-                has_leading_space && col > 0
-            else
-                col > 0
+        col += Tachikoma.display_width(g)
+    end
+    function flush()
+        push!(lines, current)
+        current = Tachikoma.Span[]
+        col = 0
+    end
+    pending = Tuple{String,Tachikoma.Style}[]
+    i = 1
+    while i <= length(units)
+        g, style = units[i]
+        if g == "\n"
+            empty!(pending)
+            flush()
+            i += 1
+        elseif !word_wrap
+            # Expand tabs deterministically without changing the raw source.
+            chars = g == "\t" ? fill(" ", 4 - col % 4) : [g]
+            for ch in chars
+                col + Tachikoma.display_width(ch) > width && flush()
+                emit(ch, style)
             end
-            if need_space && col + 1 + w > width
-                # Wrap
-                push!(lines, current)
-                current = Tachikoma.Span[]
-                col = 0
-                need_space = false
+            i += 1
+        elseif all(isspace, g)
+            push!(pending, (" ", style))
+            i += 1
+        else
+            j = i
+            while j <= length(units) && !all(isspace, units[j][1])
+                j += 1
             end
-            if need_space
-                push!(current, Tachikoma.Span(" ", space_style))
-                col += 1
+            wordwidth = sum(k -> Tachikoma.display_width(units[k][1]), i:j-1; init=0)
+            if col > 0 && col + length(pending) + wordwidth > width
+                flush()
+                empty!(pending)
             end
-            # If a single word exceeds width, emit it anyway (don't infinite loop)
-            push!(current, Tachikoma.Span(string(word), span.style))
-            col += w
-        end
-        # If span had trailing space, emit it so the next span starts after a space
-        if has_trailing_space && col > 0
-            push!(current, Tachikoma.Span(" ", space_style))
-            col += 1
+            for (space, ss) in pending
+                col < width && emit(space, ss)
+            end
+            empty!(pending)
+            for k in i:j-1
+                ch, st = units[k]
+                col + Tachikoma.display_width(ch) > width && flush()
+                emit(ch, st)
+            end
+            i = j
         end
     end
-    !isempty(current) && push!(lines, current)
-    isempty(lines) ? [Tachikoma.Span[]] : lines
+    # Prose trailing whitespace has no visual meaning; code takes the other path.
+    (!isempty(current) || isempty(lines)) && push!(lines, current)
+    lines
+end
+
+function _merge_style(base::Tachikoma.Style, over::Tachikoma.Style)
+    Tachikoma.Style(fg=over.fg isa Tachikoma.NoColor ? base.fg : over.fg,
+        bg=over.bg isa Tachikoma.NoColor ? base.bg : over.bg,
+        bold=base.bold || over.bold, dim=base.dim || over.dim,
+        italic=base.italic || over.italic, underline=base.underline || over.underline,
+        strikethrough=base.strikethrough || over.strikethrough,
+        hyperlink=isempty(over.hyperlink) ? base.hyperlink : over.hyperlink)
+end
+
+function _emit_wrapped!(ctx::WalkContext, spans::Vector{Tachikoma.Span}; word_wrap=true)
+    for line in _wrap_spans(spans, ctx.width - _current_prefix_len(ctx), ctx.text; word_wrap)
+        _push_line!(ctx, line)
+    end
 end
 
 function __init__()
